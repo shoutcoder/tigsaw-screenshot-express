@@ -3,11 +3,14 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const compression = require('compression');
 
 puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+app.use(compression());
 
 app.use(express.json({ limit: '1mb' }));
 app.use(
@@ -439,6 +442,7 @@ app.post('/colors', async (req, res) => {
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
           Referer: new URL(url).origin,
         },
         signal: controller.signal,
@@ -529,55 +533,53 @@ app.post('/colors', async (req, res) => {
     const cssColors = [];
     const limitedCssLinks = cssLinks.slice(0, 5);
 
-    // Collect external CSS content (first pass)
-    for (const cssUrl of limitedCssLinks) {
-      try {
-        const cssResponse = await fetch(cssUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-          },
-          signal: AbortSignal.timeout(10000),
-        });
-        if (cssResponse.ok) {
-          const cssContent = await cssResponse.text();
-          allCssContent += cssContent + '\n';
+    // Collect external CSS content (first pass, parallel)
+    const cssContentByUrl = {};
+    await Promise.all(
+      limitedCssLinks.map(async (cssUrl) => {
+        try {
+          const cssResponse = await fetch(cssUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+              'Accept-Encoding': 'gzip, deflate, br',
+            },
+            signal: AbortSignal.timeout(10000),
+          });
+          if (cssResponse.ok) {
+            const cssContent = await cssResponse.text();
+            cssContentByUrl[cssUrl] = cssContent;
+          }
+        } catch (e) {
+          console.warn(`Failed CSS fetch ${cssUrl}`);
         }
-      } catch (e) {
-        console.warn(`Failed CSS fetch ${cssUrl}`);
-      }
-    }
+      })
+    );
+    allCssContent += limitedCssLinks.map((u) => cssContentByUrl[u] || '').join('\n');
 
     const updatedCssVariables = extractCSSVariables(allCssContent);
 
-    // Second pass: extract colors from external CSS using updated variables
+    // Second pass: extract colors from external CSS using updated variables (reuse first-pass content)
     for (const cssUrl of limitedCssLinks) {
-      try {
-        const cssResponse = await fetch(cssUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-          signal: AbortSignal.timeout(10000),
-        });
-        if (cssResponse.ok) {
-          const cssContent = await cssResponse.text();
-          cssColors.push(...extractColorsFromCSS(cssContent, updatedCssVariables));
+      const cssContent = cssContentByUrl[cssUrl];
+      if (!cssContent) continue;
+      cssColors.push(...extractColorsFromCSS(cssContent, updatedCssVariables));
 
-          // Extract images from CSS background-image URLs
-          const cssBackgroundImages = cssContent.match(/background-image:\s*url\(["']?([^"')]+)["']?\)/gi) || [];
-          cssBackgroundImages.forEach((bg) => {
-            const m = bg.match(/url\(["']?([^"')]+)["']?\)/);
-            if (m) {
-              const u = m[1];
-              let abs;
-              if (u.startsWith('//')) abs = `https:${u}`;
-              else if (u.startsWith('/')) abs = new URL(u, cssUrl).toString();
-              else if (!u.startsWith('http') && !u.startsWith('data:')) abs = new URL(u, cssUrl).toString();
-              else abs = u;
-              if (abs && !abs.startsWith('data:') && !abs.includes('base64')) {
-                allImages.push(abs);
-              }
-            }
-          });
+      // Extract images from CSS background-image URLs
+      const cssBackgroundImages = cssContent.match(/background-image:\s*url\(["']?([^"')]+)["']?\)/gi) || [];
+      cssBackgroundImages.forEach((bg) => {
+        const m = bg.match(/url\(["']?([^"')]+)["']?\)/);
+        if (m) {
+          const u = m[1];
+          let abs;
+          if (u.startsWith('//')) abs = `https:${u}`;
+          else if (u.startsWith('/')) abs = new URL(u, cssUrl).toString();
+          else if (!u.startsWith('http') && !u.startsWith('data:')) abs = new URL(u, cssUrl).toString();
+          else abs = u;
+          if (abs && !abs.startsWith('data:') && !abs.includes('base64')) {
+            allImages.push(abs);
+          }
         }
-      } catch {}
+      });
     }
 
     // Re-extract HTML colors with updated variables
@@ -701,6 +703,7 @@ app.post('/website-data', async (req, res) => {
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
           Referer: new URL(url).origin,
         },
         signal: controller.signal,
@@ -790,55 +793,53 @@ app.post('/website-data', async (req, res) => {
     const cssColors = [];
     const limitedCssLinks = cssLinks.slice(0, 5);
 
-    // Collect external CSS content (first pass)
-    for (const cssUrl of limitedCssLinks) {
-      try {
-        const cssResponse = await fetch(cssUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-          },
-          signal: AbortSignal.timeout(10000),
-        });
-        if (cssResponse.ok) {
-          const cssContent = await cssResponse.text();
-          allCssContent += cssContent + '\n';
+    // Collect external CSS content (first pass, parallel)
+    const cssContentByUrl = {};
+    await Promise.all(
+      limitedCssLinks.map(async (cssUrl) => {
+        try {
+          const cssResponse = await fetch(cssUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+              'Accept-Encoding': 'gzip, deflate, br',
+            },
+            signal: AbortSignal.timeout(10000),
+          });
+          if (cssResponse.ok) {
+            const cssContent = await cssResponse.text();
+            cssContentByUrl[cssUrl] = cssContent;
+          }
+        } catch (e) {
+          console.warn(`Failed CSS fetch ${cssUrl}`);
         }
-      } catch (e) {
-        console.warn(`Failed CSS fetch ${cssUrl}`);
-      }
-    }
+      })
+    );
+    allCssContent += limitedCssLinks.map((u) => cssContentByUrl[u] || '').join('\n');
 
     const updatedCssVariables = extractCSSVariables(allCssContent);
 
-    // Second pass: extract colors from external CSS using updated variables
+    // Second pass: extract colors from external CSS using updated variables (reuse first-pass content)
     for (const cssUrl of limitedCssLinks) {
-      try {
-        const cssResponse = await fetch(cssUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-          signal: AbortSignal.timeout(10000),
-        });
-        if (cssResponse.ok) {
-          const cssContent = await cssResponse.text();
-          cssColors.push(...extractColorsFromCSS(cssContent, updatedCssVariables));
+      const cssContent = cssContentByUrl[cssUrl];
+      if (!cssContent) continue;
+      cssColors.push(...extractColorsFromCSS(cssContent, updatedCssVariables));
 
-          // Extract images from CSS background-image URLs
-          const cssBackgroundImages = cssContent.match(/background-image:\s*url\(["']?([^"')]+)["']?\)/gi) || [];
-          cssBackgroundImages.forEach((bg) => {
-            const m = bg.match(/url\(["']?([^"')]+)["']?\)/);
-            if (m) {
-              const u = m[1];
-              let abs;
-              if (u.startsWith('//')) abs = `https:${u}`;
-              else if (u.startsWith('/')) abs = new URL(u, cssUrl).toString();
-              else if (!u.startsWith('http') && !u.startsWith('data:')) abs = new URL(u, cssUrl).toString();
-              else abs = u;
-              if (abs && !abs.startsWith('data:') && !abs.includes('base64')) {
-                allImages.push(abs);
-              }
-            }
-          });
+      // Extract images from CSS background-image URLs
+      const cssBackgroundImages = cssContent.match(/background-image:\s*url\(["']?([^"')]+)["']?\)/gi) || [];
+      cssBackgroundImages.forEach((bg) => {
+        const m = bg.match(/url\(["']?([^"')]+)["']?\)/);
+        if (m) {
+          const u = m[1];
+          let abs;
+          if (u.startsWith('//')) abs = `https:${u}`;
+          else if (u.startsWith('/')) abs = new URL(u, cssUrl).toString();
+          else if (!u.startsWith('http') && !u.startsWith('data:')) abs = new URL(u, cssUrl).toString();
+          else abs = u;
+          if (abs && !abs.startsWith('data:') && !abs.includes('base64')) {
+            allImages.push(abs);
+          }
         }
-      } catch {}
+      });
     }
 
     // Re-extract HTML colors with updated variables
