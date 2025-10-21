@@ -121,20 +121,77 @@ function extractContent(html, url) {
   };
 }
 
+// Helper: resolve a bare domain or URL to a working variant
+async function resolveWorkingUrl(input) {
+  const raw = (input || '').trim();
+  if (!raw) throw new Error('URL is required');
+
+  let candidates = [];
+  try {
+    const u = new URL(raw);
+    candidates.push(u.toString());
+    const host = u.host.replace(/^www\./i, '');
+    candidates.push(`https://${host}/`);
+    candidates.push(`https://www.${host}/`);
+    candidates.push(`http://${host}/`);
+    candidates.push(`http://www.${host}/`);
+  } catch {
+    const host = raw.replace(/^[a-z]+:\/\/+/i, '').replace(/^www\./i, '');
+    candidates = [
+      `https://${host}/`,
+      `https://www.${host}/`,
+      `http://${host}/`,
+      `http://www.${host}/`,
+    ];
+  }
+
+  candidates = Array.from(new Set(candidates));
+
+  const controllers = candidates.map(() => new AbortController());
+  const timers = controllers.map((ctrl) => setTimeout(() => ctrl.abort(), 5000));
+
+  const attempts = candidates.map((c, i) => {
+    const headers = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.1',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      Referer: new URL(c).origin,
+    };
+    return fetch(c, { headers, method: 'GET', signal: controllers[i].signal, redirect: 'follow' }).then((resp) => {
+      if (resp.status < 400) return c;
+      throw new Error(`Status ${resp.status}`);
+    });
+  });
+
+  try {
+    const winner = await Promise.any(attempts);
+    timers.forEach((t) => clearTimeout(t));
+    controllers.forEach((ctrl, i) => {
+      if (candidates[i] !== winner) {
+        try {
+          ctrl.abort();
+        } catch {}
+      }
+    });
+    return winner;
+  } catch {
+    timers.forEach((t) => clearTimeout(t));
+    const fallback = candidates.find((c) => c.startsWith('https://')) || candidates[0];
+    return fallback;
+  }
+}
+
 // POST /extract — uses Puppeteer with stealth to bypass Cloudflare/bot checks
 app.post('/extract', async (req, res) => {
   try {
     const { url } = req.body || {};
-
-    if (!url) {
+    if (!url || typeof url !== 'string') {
       return res.status(400).json({ error: 'URL is required' });
     }
 
-    try {
-      new URL(url);
-    } catch {
-      return res.status(400).json({ error: 'Invalid URL format' });
-    }
+    const finalUrl = await resolveWorkingUrl(url);
 
     const browser = await puppeteer.launch({
       headless: 'new',
@@ -157,7 +214,7 @@ app.post('/extract', async (req, res) => {
     await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
 
     // Navigate and wait for Cloudflare/anti-bot interstitials to clear
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await page.goto(finalUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
 
     // Wait for body to be present and non-empty
     await page.waitForSelector('body', { timeout: 60000 });
@@ -190,7 +247,7 @@ app.post('/extract', async (req, res) => {
 
     const html = await page.content();
 
-    const extracted = extractContent(html, url);
+    const extracted = extractContent(html, finalUrl);
 
     await browser.close();
 
@@ -239,16 +296,11 @@ app.get('/screenshot', (req, res) => {
 app.post('/screenshot', async (req, res) => {
   try {
     const { url } = req.body || {};
-
-    if (!url) {
+    if (!url || typeof url !== 'string') {
       return res.status(400).json({ error: 'URL is required' });
     }
 
-    try {
-      new URL(url);
-    } catch {
-      return res.status(400).json({ error: 'Invalid URL format' });
-    }
+    const finalUrl = await resolveWorkingUrl(url);
 
     const browser = await puppeteer.launch({
       headless: 'new',
@@ -269,7 +321,7 @@ app.post('/screenshot', async (req, res) => {
     await page.setUserAgent(userAgent);
     await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 });
+    await page.goto(finalUrl, { waitUntil: 'networkidle2', timeout: 90000 });
 
     await page.waitForSelector('body', { timeout: 60000 });
 
@@ -306,7 +358,7 @@ app.post('/screenshot', async (req, res) => {
     return res.json({
       success: true,
       screenshot: `data:image/png;base64,${base64Screenshot}`,
-      url,
+      url: finalUrl,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
@@ -422,28 +474,24 @@ function extractCTAColors($, cssContent) {
 app.post('/colors', async (req, res) => {
   try {
     const { url } = req.body || {};
-    if (!url) {
+    if (!url || typeof url !== 'string') {
       return res.status(400).json({ error: 'URL is required' });
     }
-    try {
-      new URL(url);
-    } catch {
-      return res.status(400).json({ error: 'Invalid URL format' });
-    }
+    const finalUrl = await resolveWorkingUrl(url);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
 
     let html = '';
     try {
-      const response = await fetch(url, {
+      const response = await fetch(finalUrl, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
           'Accept-Encoding': 'gzip, deflate, br',
-          Referer: new URL(url).origin,
+          Referer: new URL(finalUrl).origin,
         },
         signal: controller.signal,
       });
@@ -473,8 +521,8 @@ app.post('/colors', async (req, res) => {
       if (!src) return;
       let abs;
       if (src.startsWith('//')) abs = `https:${src}`;
-      else if (src.startsWith('/')) abs = new URL(src, url).toString();
-      else if (!src.startsWith('http') && !src.startsWith('data:')) abs = new URL(src, url).toString();
+      else if (src.startsWith('/')) abs = new URL(src, finalUrl).toString();
+      else if (!src.startsWith('http') && !src.startsWith('data:')) abs = new URL(src, finalUrl).toString();
       else abs = src;
       if (abs && !abs.startsWith('data:') && !abs.includes('base64')) {
         allImages.push(abs);
@@ -490,8 +538,8 @@ app.post('/colors', async (req, res) => {
         const u = m[1];
         let abs;
         if (u.startsWith('//')) abs = `https:${u}`;
-        else if (u.startsWith('/')) abs = new URL(u, url).toString();
-        else if (!u.startsWith('http') && !u.startsWith('data:')) abs = new URL(u, url).toString();
+        else if (u.startsWith('/')) abs = new URL(u, finalUrl).toString();
+        else if (!u.startsWith('http') && !u.startsWith('data:')) abs = new URL(u, finalUrl).toString();
         else abs = u;
         if (abs && !abs.startsWith('data:') && !abs.includes('base64')) {
           allImages.push(abs);
@@ -525,7 +573,7 @@ app.post('/colors', async (req, res) => {
       const href = $(el).attr('href');
       if (href) {
         try {
-          cssLinks.push(new URL(href, url).toString());
+          cssLinks.push(new URL(href, finalUrl).toString());
         } catch {}
       }
     });
@@ -650,7 +698,7 @@ app.post('/colors', async (req, res) => {
       ctaColors: processedCtaColors,
       generalColors: finalGeneralColors,
       images: uniqueImages,
-      metadata: { title, description: metaDescription, url },
+      metadata: { title, description: metaDescription, url: finalUrl },
     });
   } catch (error) {
     console.error('Error extracting colors:', error);
@@ -683,28 +731,24 @@ app.get('/website-data', (_req, res) => {
 app.post('/website-data', async (req, res) => {
   try {
     const { url } = req.body || {};
-    if (!url) {
+    if (!url || typeof url !== 'string') {
       return res.status(400).json({ error: 'URL is required' });
     }
-    try {
-      new URL(url);
-    } catch {
-      return res.status(400).json({ error: 'Invalid URL format' });
-    }
+    const finalUrl = await resolveWorkingUrl(url);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
 
     let html = '';
     try {
-      const response = await fetch(url, {
+      const response = await fetch(finalUrl, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
           Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
           'Accept-Encoding': 'gzip, deflate, br',
-          Referer: new URL(url).origin,
+          Referer: new URL(finalUrl).origin,
         },
         signal: controller.signal,
       });
@@ -734,8 +778,8 @@ app.post('/website-data', async (req, res) => {
       if (!src) return;
       let abs;
       if (src.startsWith('//')) abs = `https:${src}`;
-      else if (src.startsWith('/')) abs = new URL(src, url).toString();
-      else if (!src.startsWith('http') && !src.startsWith('data:')) abs = new URL(src, url).toString();
+      else if (src.startsWith('/')) abs = new URL(src, finalUrl).toString();
+      else if (!src.startsWith('http') && !src.startsWith('data:')) abs = new URL(src, finalUrl).toString();
       else abs = src;
       if (abs && !abs.startsWith('data:') && !abs.includes('base64')) {
         allImages.push(abs);
@@ -750,8 +794,8 @@ app.post('/website-data', async (req, res) => {
         const u = m[1];
         let abs;
         if (u.startsWith('//')) abs = `https:${u}`;
-        else if (u.startsWith('/')) abs = new URL(u, url).toString();
-        else if (!u.startsWith('http') && !u.startsWith('data:')) abs = new URL(u, url).toString();
+        else if (u.startsWith('/')) abs = new URL(u, finalUrl).toString();
+        else if (!u.startsWith('http') && !u.startsWith('data:')) abs = new URL(u, finalUrl).toString();
         else abs = u;
         if (abs && !abs.startsWith('data:') && !abs.includes('base64')) {
           allImages.push(abs);
@@ -785,7 +829,7 @@ app.post('/website-data', async (req, res) => {
       const href = $(el).attr('href');
       if (href) {
         try {
-          cssLinks.push(new URL(href, url).toString());
+          cssLinks.push(new URL(href, finalUrl).toString());
         } catch {}
       }
     });
@@ -937,7 +981,7 @@ app.post('/website-data', async (req, res) => {
       fonts: uniqueFonts,
       headings,
       paragraphs,
-      metadata: { title, description: metaDescription, url },
+      metadata: { title, description: metaDescription, url: finalUrl },
     });
   } catch (error) {
     console.error('Error extracting website data:', error);
